@@ -182,6 +182,8 @@ namespace Battery24GTray
             for (int attempt = 0; attempt < 3; attempt++)
             {
                 byte[] resp = dev.IoTransfer(req, 250);
+                if (resp != null)
+                    Program.AppendLog("[Mchose raw] " + BitConverter.ToString(resp));
                 BatteryReading r = ParseInterruptResponse(resp);
                 if (r != null) return r;
                 Thread.Sleep(40);

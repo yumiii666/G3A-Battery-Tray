@@ -21,14 +21,14 @@ namespace Battery24GTray
         private const int PollIntervalMs = 30000;
 
         private NotifyIcon _notifyIcon;
-        private readonly IBatteryProvider _provider;
+        private IBatteryProvider _provider;
         private ThreadTimer _timer;
         private ThreadTimer _selfTestTimer;
         private ThreadTimer _heartbeat;
         private TaskbarWatcher _watcher;
         private ToolStripMenuItem _sourceItem;
         private ToolStripMenuItem _autoStartItem;
-        private readonly bool _demo;
+        private bool _demo;
         private readonly bool _selfTest;
         private readonly int _selfTestSeconds;
         private IntPtr _lastIconHandle = IntPtr.Zero;
@@ -36,6 +36,18 @@ namespace Battery24GTray
         private int _pollBusy;
         private SynchronizationContext _syncCtx;
         private bool _initialized;
+
+        // ---- 跳变过滤 ----
+        // 鼠标休眠/刚开机时接收器对电量查询照样回包，但电量字节是垃圾值
+        // （实测：休眠=00、开机阶段=50/80），鼠标在线才回真实值。
+        // 记住上一次"可信"读数（跨重启持久化）；新读数跳变 >30% 且非充电
+        // → 先沿用旧值；同一可疑值持续 30 分钟才放行（兜底解锁，防死锁）。
+        private int? _lastGoodPct;
+        private int? _suspectPct;
+        private DateTime _suspectSince;
+        private static readonly string StatePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Battery24GTray.state");
 
         /// <summary>Exposes the UI thread sync context for external observers.</summary>
         public SynchronizationContext SyncContext
@@ -57,6 +69,19 @@ namespace Battery24GTray
         {
             AppendLog("[CTX] constructor start");
             _demo = demo;
+            try
+            {
+                if (File.Exists(StatePath))
+                {
+                    int v;
+                    if (int.TryParse(File.ReadAllText(StatePath).Trim(), out v) && v > 0 && v <= 100)
+                    {
+                        _lastGoodPct = v;
+                        AppendLog("[CTX] loaded lastGood=" + v);
+                    }
+                }
+            }
+            catch { }
             _selfTest = selfTestSeconds > 0;
             _selfTestSeconds = selfTestSeconds;
             if (_selfTest)
@@ -115,8 +140,13 @@ namespace Battery24GTray
                 demoItem.Checked = _demo;
                 demoItem.Click += delegate
                 {
-                    System.Diagnostics.Process.Start(Application.ExecutablePath, _demo ? "" : "--demo");
-                    ExitThread();
+                    // 原地切换，不再"重启进程"——以前点一次会退出再拉起，
+                    // 连点几次在启动竞态下会一个实例都不剩
+                    _demo = !_demo;
+                    demoItem.Checked = _demo;
+                    _provider = BuildProvider();
+                    AppendLog("[CTX] demo toggled -> " + _demo);
+                    QueueRefresh();
                 };
                 menu.Items.Add(demoItem);
 
@@ -245,10 +275,65 @@ namespace Battery24GTray
             string source;
             if (r != null && r.Percent.HasValue)
             {
-                SetIconHandle(BatteryIconRenderer.Render(r.Percent.Value, r.Charging));
-                string state = r.Charging ? " 充电中" : "";
-                text = string.Format("{0}  {1}%{2}", r.SourceName, r.Percent.Value, state);
-                source = "数据源: " + r.SourceName;
+                int pct = r.Percent.Value;
+                bool charging = r.Charging;
+
+                if (pct == 0)
+                {
+                    // 0% 是鼠标离线时的垃圾字节（真没电的鼠机会直接不回应）
+                    AppendLog("[Filter] pct=0=离线垃圾值，忽略");
+                    if (_lastGoodPct.HasValue) pct = _lastGoodPct.Value;
+                    else r = null;
+                }
+                else if (_lastGoodPct.HasValue && !charging &&
+                         Math.Abs(pct - _lastGoodPct.Value) > 30)
+                {
+                    // 大跳变且非充电 → 疑似开机/休眠垃圾值，先沿用上次真实读数；
+                    // 但只要鼠标最近动过（在线），电量就可信 → 立即放行
+                    bool mouseActive =
+                        (DateTime.UtcNow - MouseActivityMonitor.LastActivityUtc).TotalMinutes < 5;
+                    if (mouseActive)
+                    {
+                        AppendLog("[Filter] 跳变 " + _lastGoodPct + "->" + pct +
+                                  "，鼠标在线，放行");
+                        AcceptPct(pct);
+                    }
+                    else if (_suspectPct.HasValue && _suspectPct.Value == pct &&
+                             (DateTime.Now - _suspectSince).TotalMinutes >= 30)
+                    {
+                        AppendLog("[Filter] 可疑值持续30分钟，放行 pct=" + pct);
+                        AcceptPct(pct);
+                    }
+                    else
+                    {
+                        if (!_suspectPct.HasValue || _suspectPct.Value != pct)
+                        {
+                            _suspectPct = pct;
+                            _suspectSince = DateTime.Now;
+                        }
+                        AppendLog("[Filter] 跳变 " + _lastGoodPct + "->" + pct +
+                                  " 可疑，沿用 " + _lastGoodPct);
+                        pct = _lastGoodPct.Value;
+                    }
+                }
+                else
+                {
+                    AcceptPct(pct);
+                }
+
+                if (r != null)
+                {
+                    SetIconHandle(BatteryIconRenderer.Render(pct, charging));
+                    string state = charging ? " 充电中" : "";
+                    text = string.Format("{0}  {1}%{2}", r.SourceName, pct, state);
+                    source = "数据源: " + r.SourceName;
+                }
+                else
+                {
+                    SetIconHandle(BatteryIconRenderer.RenderUnknown());
+                    text = _demo ? "演示模式" : "未检测到支持的 2.4G 接收器";
+                    source = "数据源: 无";
+                }
             }
             else
             {
@@ -261,6 +346,15 @@ namespace Battery24GTray
             _sourceItem.Text = source;
 
             if (_selfTest) Console.WriteLine("[selftest] " + text);
+        }
+
+        /// <summary>接受一个读数为"可信值"，清掉可疑状态并持久化（跨重启记忆）。</summary>
+        private void AcceptPct(int pct)
+        {
+            _lastGoodPct = pct;
+            _suspectPct = null;
+            try { File.WriteAllText(StatePath, pct.ToString()); }
+            catch { }
         }
 
         protected override void ExitThreadCore()

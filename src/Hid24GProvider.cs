@@ -22,6 +22,7 @@ namespace Battery24GTray
             _protocols.Add(new LogitechHidPlusPlus());
             _protocols.Add(new MchoseProtocol());
             _protocols.AddRange(ConfigurableProtocol.LoadAll());
+            MouseActivityMonitor.Start(0xA8A5); // 迈从接收器；找不到该 VID 时回退监听任意鼠标
         }
 
         public BatteryReading Read()

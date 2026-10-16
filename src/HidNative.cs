@@ -292,33 +292,53 @@ namespace Battery24GTray
         private void ReadLoop()
         {
             int len = Math.Max((int)Info.InputLen, 8);
-            while (!_disposed)
+            try
             {
-                byte[] buf = new byte[len];
-                ManualResetEvent evt = new ManualResetEvent(false);
-                try
+                while (!_disposed)
                 {
-                    HidNative.OVERLAPPED ov = new HidNative.OVERLAPPED();
-                    ov.hEvent = evt.SafeWaitHandle.DangerousGetHandle();
-                    bool ok = HidNative.ReadFileOverlapped(_handle, buf, (uint)len, IntPtr.Zero, ref ov);
-                    int err = ok ? 0 : Marshal.GetLastWin32Error();
-                    if (ok)
+                    // 局部捕获句柄：Dispose 可能把 _handle 置 null，防止空引用进 P/Invoke
+                    SafeFileHandle handle = _handle;
+                    if (handle == null || handle.IsClosed) break;
+
+                    byte[] buf = new byte[len];
+                    ManualResetEvent evt = new ManualResetEvent(false);
+                    try
                     {
-                        EnqueueReport(buf, len);
-                        continue;
-                    }
-                    if (err != HidNative.ERROR_IO_PENDING) break; // 句柄已关闭
-                    evt.WaitOne(); // Dispose 时 CancelIoEx/CloseHandle 会唤醒
-                    if (_disposed) break;
-                    uint xfer;
-                    if (!HidNative.GetOverlappedResult(_handle, ref ov, out xfer, false) || xfer == 0)
-                    {
+                        HidNative.OVERLAPPED ov = new HidNative.OVERLAPPED();
+                        ov.hEvent = evt.SafeWaitHandle.DangerousGetHandle();
+                        bool ok;
+                        int err;
+                        try
+                        {
+                            ok = HidNative.ReadFileOverlapped(handle, buf, (uint)len, IntPtr.Zero, ref ov);
+                            err = ok ? 0 : Marshal.GetLastWin32Error();
+                        }
+                        catch (Exception)
+                        {
+                            break; // 句柄已被 Dispose 关闭/置空 → 读循环结束
+                        }
+                        if (ok)
+                        {
+                            EnqueueReport(buf, len);
+                            continue;
+                        }
+                        if (err != HidNative.ERROR_IO_PENDING) break; // 句柄已关闭
+                        evt.WaitOne(); // Dispose 时 CancelIoEx/CloseHandle 会唤醒
                         if (_disposed) break;
-                        continue;
+                        uint xfer;
+                        if (!HidNative.GetOverlappedResult(handle, ref ov, out xfer, false) || xfer == 0)
+                        {
+                            if (_disposed) break;
+                            continue;
+                        }
+                        EnqueueReport(buf, (int)xfer);
                     }
-                    EnqueueReport(buf, (int)xfer);
+                    finally { evt.Dispose(); }
                 }
-                finally { evt.Dispose(); }
+            }
+            catch (Exception)
+            {
+                // 兜底：后台线程未处理异常会终止整个进程，这里必须吞掉
             }
         }
 
@@ -381,6 +401,14 @@ namespace Battery24GTray
             finally { evt.Dispose(); }
         }
 
+        /// <summary>从后台读队列等待一条输入报告（供活动监视等旁路消费者使用）。</summary>
+        public byte[] WaitForReport(int timeoutMs)
+        {
+            byte[] r;
+            if (_ioReports.TryTake(out r, timeoutMs)) return r;
+            return null;
+        }
+
         public void Dispose()
         {
             _disposed = true;
@@ -391,6 +419,56 @@ namespace Battery24GTray
                 _handle = null;
             }
             try { _ioReports.Dispose(); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// 鼠标活动监视：以共享方式打开标准鼠标接口（usagePage 0x01 / usage 0x02），
+    /// 任何输入报告 = 用户在动鼠标 = 鼠标在线。用于电量跳变过滤的放行判据：
+    /// 鼠标活动时接收器回报的电量才可信；鼠标没动时的大跳变视为休眠垃圾值。
+    /// 打开失败则静默停用（跳变过滤退回"30 分钟持续放行"的兜底路径）。
+    /// </summary>
+    internal static class MouseActivityMonitor
+    {
+        private static long _lastTicksUtc = DateTime.MinValue.Ticks;
+
+        /// <summary>最后一次看到鼠标动作的 UTC 时间；从未看到则为 DateTime.MinValue。</summary>
+        public static DateTime LastActivityUtc
+        {
+            get { return new DateTime(Interlocked.Read(ref _lastTicksUtc), DateTimeKind.Utc); }
+        }
+
+        public static void Start(ushort preferredVid)
+        {
+            try
+            {
+                List<HidDeviceInfo> list = HidNative.Enumerate();
+                HidDeviceInfo target = null;
+                foreach (HidDeviceInfo d in list)
+                    if (d.UsagePage == 0x01 && d.Usage == 0x02 && d.Vid == preferredVid)
+                    { target = d; break; }
+                if (target == null)
+                    foreach (HidDeviceInfo d in list)
+                        if (d.UsagePage == 0x01 && d.Usage == 0x02)
+                        { target = d; break; }
+                if (target == null) return;
+
+                HidDevice dev = new HidDevice();
+                if (!dev.Open(target)) return;
+
+                Thread t = new Thread(delegate()
+                {
+                    while (true)
+                    {
+                        byte[] r = dev.WaitForReport(2000);
+                        if (r != null && r.Length > 0)
+                            Interlocked.Exchange(ref _lastTicksUtc, DateTime.UtcNow.Ticks);
+                    }
+                });
+                t.IsBackground = true;
+                t.Start();
+            }
+            catch { }
         }
     }
 }

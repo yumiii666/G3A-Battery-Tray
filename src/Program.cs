@@ -100,7 +100,7 @@ namespace Battery24GTray
 
         internal static readonly object _logLock = new object();
 
-        private static void AppendLog(string line)
+        internal static void AppendLog(string line)
         {
             try
             {
